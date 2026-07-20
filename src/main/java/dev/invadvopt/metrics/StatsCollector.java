@@ -9,8 +9,10 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 
 public final class StatsCollector {
     private static final int HISTOGRAM_BUCKETS = 64;
@@ -25,30 +27,17 @@ public final class StatsCollector {
     private final AtomicLong maxNanos = new AtomicLong();
     private final LongAdder[] latencyBuckets = new LongAdder[HISTOGRAM_BUCKETS];
     private final Map<String, LongAdder> fallbackReasons = new ConcurrentHashMap<>();
+    private final Map<String, LongAdder> indexConditions = new ConcurrentHashMap<>();
     private final Map<UUID, LongAdder> playerHotspots = new ConcurrentHashMap<>();
-    private final Map<String, LongAdder> itemHotspots = new ConcurrentHashMap<>();
-    private final ThreadLocal<Integer> predicateScopeDepth = ThreadLocal.withInitial(() -> 0);
+    private final Map<ResourceLocation, LongAdder> itemHotspots = new ConcurrentHashMap<>();
     private volatile boolean enabled = true;
 
     public StatsCollector() {
         for (int i = 0; i < latencyBuckets.length; i++) latencyBuckets[i] = new LongAdder();
     }
 
-    public void startPredicateScope() {
-        if (!enabled) return;
-        predicateScopeDepth.set(predicateScopeDepth.get() + 1);
-    }
-
-    public void endPredicateScope() {
-        if (!enabled) return;
-        int depth = predicateScopeDepth.get() - 1;
-        if (depth <= 0) predicateScopeDepth.remove();
-        else predicateScopeDepth.set(depth);
-    }
-
-    public void onItemPredicateTest() {
-        if (!enabled) return;
-        if (predicateScopeDepth.get() > 0) predicateTests.increment();
+    public void recordPredicateTests(long count) {
+        if (enabled && count > 0L) predicateTests.add(count);
     }
 
     public void recordTrigger(ServerPlayer player, ItemStack changedStack, int raw, int candidates, long nanos) {
@@ -60,7 +49,7 @@ public final class StatsCollector {
         maxNanos.accumulateAndGet(nanos, Math::max);
         latencyBuckets[bucket(nanos)].increment();
         playerHotspots.computeIfAbsent(player.getUUID(), ignored -> new LongAdder()).increment();
-        String item = changedStack.isEmpty() ? "minecraft:air" : BuiltInRegistries.ITEM.getKey(changedStack.getItem()).toString();
+        ResourceLocation item = BuiltInRegistries.ITEM.getKey(changedStack.isEmpty() ? Items.AIR : changedStack.getItem());
         itemHotspots.computeIfAbsent(item, ignored -> new LongAdder()).increment();
     }
 
@@ -80,9 +69,21 @@ public final class StatsCollector {
         mismatches.increment();
     }
 
+    public void recordIndexCondition(String condition) {
+        recordIndexCondition(condition, 1L);
+    }
+
+    public void recordIndexCondition(String condition, long count) {
+        if (!enabled || count <= 0L) return;
+        indexConditions.computeIfAbsent(condition, ignored -> new LongAdder()).add(count);
+    }
+
     public void setEnabled(boolean enabled) {
         this.enabled = enabled;
-        if (!enabled) predicateScopeDepth.remove();
+    }
+
+    public boolean enabled() {
+        return enabled;
     }
 
     public Snapshot snapshot() {
@@ -90,7 +91,8 @@ public final class StatsCollector {
         long raw = rawListeners.sum();
         long candidate = candidateListeners.sum();
         return new Snapshot(triggerCount, raw, candidate, predicateTests.sum(), fullScans.sum(), fallbacks.sum(), mismatches.sum(),
-                totalNanos.sum(), maxNanos.get(), percentile95(triggerCount), copy(fallbackReasons), top(playerHotspots, 10), top(itemHotspots, 10));
+                totalNanos.sum(), maxNanos.get(), percentile95(triggerCount), copy(fallbackReasons), copy(indexConditions),
+                top(playerHotspots, 10), top(itemHotspots, 10));
     }
 
     public void reset() {
@@ -105,6 +107,7 @@ public final class StatsCollector {
         maxNanos.set(0L);
         for (LongAdder bucket : latencyBuckets) bucket.reset();
         fallbackReasons.clear();
+        indexConditions.clear();
         playerHotspots.clear();
         itemHotspots.clear();
     }
@@ -153,6 +156,7 @@ public final class StatsCollector {
             long maxNanos,
             long p95Nanos,
             Map<String, Long> fallbackReasons,
+            Map<String, Long> indexConditions,
             List<Hotspot> playerHotspots,
             List<Hotspot> itemHotspots) {
         public double reductionPercent() {

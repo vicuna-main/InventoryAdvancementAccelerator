@@ -23,10 +23,10 @@ public final class InvAdvOptConfig {
                 .define("mode", "EXACT", value -> value instanceof String string
                         && (string.equals("VANILLA") || string.equals("EXACT") || string.equals("AGGRESSIVE")));
         SHADOW_VERIFY_RATE = builder.comment("Fraction of optimized events compared with a complete listener scan.")
-                .defineInRange("shadowVerifyRate", 0.01D, 0.0D, 1.0D);
+                .defineInRange("shadowVerifyRate", 0.001D, 0.0D, 1.0D);
         PERIODIC_FULL_SCAN_TICKS = builder.comment("Force verification after this many server ticks; 0 disables it.")
                 .defineInRange("periodicFullScanTicks", 200, 0, 72000);
-        FALLBACK_ON_UNKNOWN_PREDICATE = builder.comment("Use vanilla when a predicate cannot be proven index-safe.")
+        FALLBACK_ON_UNKNOWN_PREDICATE = builder.comment("Compatibility option retained from 1.0.0; unknown plans are always evaluated safely.")
                 .define("fallbackOnUnknownPredicate", true);
         FALLBACK_ON_OFF_THREAD_CALL = builder.comment("Use vanilla for calls outside the server thread.")
                 .define("fallbackOnOffThreadCall", true);

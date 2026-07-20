@@ -14,7 +14,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 abstract class InventoryChangeTriggerMixin {
     @Inject(method = "trigger(Lnet/minecraft/server/level/ServerPlayer;Lnet/minecraft/world/entity/player/Inventory;Lnet/minecraft/world/item/ItemStack;)V", at = @At("HEAD"), cancellable = true, require = 0)
     private void invadvopt$replaceTrigger(ServerPlayer player, Inventory inventory, ItemStack stack, CallbackInfo callback) {
-        if (InvAdvOpt.RUNTIME.handleTrigger(player, inventory, stack)) {
+        if (InvAdvOpt.RUNTIME.handleTrigger((InventoryChangeTrigger)(Object)this, player, inventory, stack)) {
             callback.cancel();
         }
     }

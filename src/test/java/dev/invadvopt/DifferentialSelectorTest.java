@@ -76,6 +76,26 @@ final class DifferentialSelectorTest {
         assertEquals(List.of(1, 2, 3), ran);
     }
 
+    @Test
+    void unsafeAndPendingPlansStayLocalInsteadOfForcingAFullCandidateSet() {
+        List<PlanState> plans = new ArrayList<>();
+        for (int id = 0; id < 10_000; id++) {
+            plans.add(new PlanState(id, Set.of(id), false, false));
+        }
+        plans.set(123, new PlanState(123, Set.of(), true, false));
+        plans.set(456, new PlanState(456, Set.of(9_999), false, true));
+
+        Set<Integer> changedItems = Set.of(17);
+        Set<Integer> candidates = new HashSet<>();
+        for (PlanState plan : plans) {
+            if (plan.unsafe() || plan.pending() || intersects(plan.items(), changedItems)) {
+                candidates.add(plan.id());
+            }
+        }
+
+        assertEquals(Set.of(17, 123, 456), candidates);
+    }
+
     private static List<Listener> randomListeners(Random random, int count, int itemKinds) {
         List<Listener> result = new ArrayList<>(count);
         for (int id = 0; id < count; id++) {
@@ -146,4 +166,6 @@ final class DifferentialSelectorTest {
         private static final Stack EMPTY = new Stack(-1, 0, 0);
         boolean empty() { return count <= 0; }
     }
+
+    private record PlanState(int id, Set<Integer> items, boolean unsafe, boolean pending) {}
 }

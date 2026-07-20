@@ -41,6 +41,7 @@ public final class InvAdvOptCommand {
                 stats.averageMicros(), stats.p95Nanos() / 1_000.0D, stats.maxNanos() / 1_000.0D,
                 stats.totalNanos() / 1_000_000.0D)), false);
         source.sendSuccess(() -> Component.literal("[invadvopt] fallbackReasons=" + stats.fallbackReasons()), false);
+        source.sendSuccess(() -> Component.literal("[invadvopt] indexConditions=" + stats.indexConditions()), false);
         source.sendSuccess(() -> Component.literal("[invadvopt] playerHotspots=" + stats.playerHotspots()), false);
         source.sendSuccess(() -> Component.literal("[invadvopt] itemHotspots=" + stats.itemHotspots()), false);
         return 1;

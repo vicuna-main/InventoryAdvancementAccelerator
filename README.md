@@ -25,13 +25,13 @@ For each trigger on the server thread:
 4. Minecraft's own `TriggerInstance.matches(...)` runs for every candidate, followed in vanilla order by the original `ContextAwarePredicate`.
 5. Matching listeners are collected first and only then run through `Listener.run(PlayerAdvancements)`. This preserves `PlayerAdvancements.award`, Bukkit/Paper advancement events, and the once-only criterion lifecycle.
 
-First use, listener registration, login, reload, tag-generation change, and circuit-breaker reset force a complete listener pass. EXACT never skips ticks, ignores empty stacks, ignores decreases, filters only by count, collapses changes to the final stack, reads Inventory asynchronously, or caches final predicate results.
+First use, login, reload, tag-generation change, and circuit-breaker reset force a complete listener pass. A newly registered listener is checked once through a dedicated pending bucket without invalidating the other listeners' snapshot. A plan which cannot be indexed safely is kept in the always-check bucket, so it remains exact without forcing the entire player index through vanilla. EXACT never skips ticks, ignores empty stacks, ignores decreases, filters only by count, collapses changes to the final stack, reads Inventory asynchronously, or caches final predicate results.
 
-Tags are expanded only as a coarse index. `ItemPredicate.test` and every component/sub-predicate remain authoritative. Unknown/incomplete plans, reload windows, off-thread calls, reentrancy, missing hooks, or internal exceptions fall through to the original method.
+Tags are expanded only as a coarse index. `ItemPredicate.test` and every component/sub-predicate remain authoritative. Unknown plans remain in the always-check bucket. Reload windows, off-thread calls, reentrancy, missing hooks, a genuinely desynchronized index, or internal exceptions fall through to the original method.
 
 ## Verification and circuit breakers
 
-The default 1% shadow sample evaluates optimized candidates and then evaluates only the omitted listeners to form a complete vanilla-equivalent identity set. Candidate listeners are not evaluated twice. Awards execute once from the selected result.
+The default 0.1% shadow sample evaluates optimized candidates and then evaluates only the omitted listeners to form a complete vanilla-equivalent result. Candidate listeners are not evaluated twice. Awards execute once from the selected result. Independent time-based verification still runs every 200 ticks, retaining a bounded ten-second verification interval for active players without paying for a full scan on roughly every hundred high-frequency equipment updates.
 
 Every 200 ticks, the next trigger for that player is force-verified. `/invadvopt verify` does the same on demand. A mismatch uses the complete result for the current event, logs only advancement/criterion IDs, UUID, item registry ID, generations, and mismatch type, then disables that player's index. Three consecutive mismatches switch the process to `VANILLA`. Full NBT is never logged.
 
@@ -42,7 +42,7 @@ NeoForge creates `config/invadvopt-common.toml` with root keys:
 ```toml
 mode = "EXACT"
 enabled = true
-shadowVerifyRate = 0.01
+shadowVerifyRate = 0.001
 periodicFullScanTicks = 200
 fallbackOnUnknownPredicate = true
 fallbackOnOffThreadCall = true
@@ -51,7 +51,9 @@ metricsEnabled = true
 debugLogging = false
 ```
 
-`AGGRESSIVE` is accepted for controlled experiments but currently uses the same no-skip engine as EXACT. It is not the default. Safety fallbacks for unknown predicates and off-thread calls remain mandatory in EXACT.
+`AGGRESSIVE` is accepted for controlled experiments but currently uses the same no-skip engine as EXACT. It is not the default. Off-thread calls and a genuinely desynchronized index still fall through before inventory scanning. `fallbackOnUnknownPredicate` is retained for configuration compatibility; unknown plans are now evaluated from the always-check bucket and do not require a global fallback.
+
+Listener lifecycle lookup uses the stable advancement ID plus criterion name, never the listener's deep predicate hash. A removal callback for an already-absent listener is counted as `remove_miss` and ignored: because the hook runs after vanilla removal, both the vanilla set and the index are already absent for that key. Only shadow verification can classify the index as genuinely desynchronized.
 
 ## Commands
 
@@ -64,7 +66,7 @@ All commands require permission level 4 (server operator):
 - `/invadvopt mode exact`
 - `/invadvopt reset-stats`
 
-Metrics include trigger count, raw/candidate listener totals, reduction, `ItemPredicate.test` calls, full scans, fallbacks by reason, mismatches, total/average/P95/max latency, and top player/item registry-ID hotspots.
+Metrics include trigger count, raw/candidate listener totals, reduction, `ItemPredicate.test` calls, full scans, fallbacks by reason, index conditions (`unsafe_plan` and `remove_miss`), mismatches, total/average/P95/max latency, and top player/item registry-ID hotspots. Predicate scopes and listener indexes are not maintained while the global mode is `VANILLA` or the optimizer is disabled.
 
 ## Build and test
 

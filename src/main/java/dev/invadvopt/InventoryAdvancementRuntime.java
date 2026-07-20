@@ -2,13 +2,12 @@ package dev.invadvopt;
 
 import com.mojang.logging.LogUtils;
 import dev.invadvopt.config.InvAdvOptConfig;
-import dev.invadvopt.index.IdentitySet;
 import dev.invadvopt.index.PlayerIndex;
 import dev.invadvopt.metrics.StatsCollector;
+import dev.invadvopt.mixin.SimpleCriterionTriggerAccessor;
 import java.lang.reflect.Method;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.Deque;
 import java.util.IdentityHashMap;
 import java.util.List;
@@ -17,6 +16,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import net.minecraft.advancements.CriterionTrigger;
 import net.minecraft.advancements.critereon.ContextAwarePredicate;
@@ -37,15 +37,21 @@ public final class InventoryAdvancementRuntime {
     private static final Logger LOGGER = LogUtils.getLogger();
     private static final Set<String> CONFLICTING_MODS = Set.of("achiopt", "cerulean", "icterine");
     private static final int GLOBAL_MISMATCH_THRESHOLD = 3;
+    private static final Verification MATCHED_VERIFICATION =
+            new Verification(true, null, List.of(), List.of());
 
     private final Map<PlayerAdvancements, PlayerIndex> indexes = new IdentityHashMap<>();
     private final AtomicLong registryGeneration = new AtomicLong();
+    private final AtomicInteger activePredicateScopes = new AtomicInteger();
     private final StatsCollector stats = new StatsCollector();
     private final ThreadLocal<ProcessingState> processing = ThreadLocal.withInitial(ProcessingState::new);
 
     private volatile OptimizationMode commandMode;
     private volatile boolean reloadInProgress;
     private volatile boolean replacementHealthy;
+    private volatile boolean selfCheckCompleted;
+    private volatile boolean indexMaintenanceSuspended;
+    private volatile boolean listenerAccessFailureLogged;
     private volatile String disabledReason = "server_not_started";
     private int consecutiveMismatches;
 
@@ -54,7 +60,9 @@ public final class InventoryAdvancementRuntime {
         List<String> conflicts = CONFLICTING_MODS.stream().filter(id -> ModList.get().isLoaded(id)).toList();
         if (!conflicts.isEmpty() || Boolean.getBoolean("invadvopt.mixin.conflict")) {
             replacementHealthy = false;
+            selfCheckCompleted = true;
             disabledReason = "conflicting_mod:" + String.join(",", conflicts);
+            suspendIndexMaintenance();
             LOGGER.error("[invadvopt] Trigger replacement refused because a conflicting advancement optimizer is loaded: {}. Vanilla behavior is retained.", conflicts);
             return;
         }
@@ -66,11 +74,14 @@ public final class InventoryAdvancementRuntime {
         if (!verifyVanillaDescriptors()) missingHooks.add("vanilla_descriptors");
         if (!missingHooks.isEmpty()) {
             replacementHealthy = false;
+            selfCheckCompleted = true;
             disabledReason = "mixin_self_check:" + String.join(",", missingHooks);
+            suspendIndexMaintenance();
             LOGGER.error("[invadvopt] Mixin self-check failed ({}). Optimization is disabled; the original trigger remains active.", missingHooks);
             return;
         }
         replacementHealthy = true;
+        selfCheckCompleted = true;
         disabledReason = "none";
         LOGGER.info("[invadvopt] EXACT inventory advancement acceleration is ready (registry generation {}).", registryGeneration.get());
     }
@@ -90,29 +101,64 @@ public final class InventoryAdvancementRuntime {
     }
 
     @SuppressWarnings("unchecked")
-    public void addListener(PlayerAdvancements advancements, CriterionTrigger.Listener<?> listener) {
+    public void addListener(InventoryChangeTrigger trigger, PlayerAdvancements advancements, CriterionTrigger.Listener<?> listener) {
+        if (!shouldMaintainIndexes()) {
+            suspendIndexMaintenance();
+            return;
+        }
         CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance> typed =
                 (CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>) listener;
         synchronized (indexes) {
-            indexes.computeIfAbsent(advancements, ignored -> new PlayerIndex()).add(typed, registryGeneration.get());
+            if (resumeIndexMaintenance()) {
+                rebuildIndex(trigger, advancements);
+                return;
+            }
+            PlayerIndex.AddResult result = indexes.computeIfAbsent(advancements, ignored -> new PlayerIndex())
+                    .add(typed, registryGeneration.get());
+            if (result == PlayerIndex.AddResult.ADDED_UNSAFE_PLAN) {
+                stats.recordIndexCondition("unsafe_plan");
+            }
         }
     }
 
     @SuppressWarnings("unchecked")
-    public void removeListener(PlayerAdvancements advancements, CriterionTrigger.Listener<?> listener) {
+    public void removeListener(InventoryChangeTrigger trigger, PlayerAdvancements advancements, CriterionTrigger.Listener<?> listener) {
+        if (!shouldMaintainIndexes()) {
+            suspendIndexMaintenance();
+            return;
+        }
         synchronized (indexes) {
+            if (resumeIndexMaintenance()) {
+                rebuildIndex(trigger, advancements);
+                return;
+            }
             PlayerIndex index = indexes.get(advancements);
-            if (index != null) index.remove((CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>) listener);
+            if (index == null) {
+                rebuildIndex(trigger, advancements);
+                return;
+            }
+            if (!index.remove((CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>) listener)) {
+                stats.recordIndexCondition("remove_miss");
+            }
         }
     }
 
     public void removeListeners(PlayerAdvancements advancements) {
+        if (!shouldMaintainIndexes()) {
+            suspendIndexMaintenance();
+            return;
+        }
         synchronized (indexes) {
             indexes.remove(advancements);
         }
     }
 
-    public boolean handleTrigger(ServerPlayer player, Inventory inventory, ItemStack changedStack) {
+    public boolean handleTrigger(InventoryChangeTrigger trigger, ServerPlayer player, Inventory inventory, ItemStack changedStack) {
+        if (!shouldMaintainIndexes()) {
+            suspendIndexMaintenance();
+            return false;
+        }
+
         ProcessingState state = processing.get();
         if (state.optimizing) {
             beginVanilla(state, player, changedStack, listenerCount(player), "reentrant_call");
@@ -127,32 +173,29 @@ public final class InventoryAdvancementRuntime {
 
         PlayerIndex index;
         synchronized (indexes) {
+            resumeIndexMaintenance();
             index = indexes.get(player.getAdvancements());
+            if (index == null) {
+                index = rebuildIndex(trigger, player.getAdvancements());
+            }
         }
         if (index == null) {
             beginVanilla(state, player, changedStack, 0, "index_missing");
             return false;
         }
 
-        state.optimizing = true;
-        long started = System.nanoTime();
-        stats.startPredicateScope();
         int rawCount = index.listenerCount();
+        String indexFallback = index.fallbackReason();
+        if (indexFallback != null) {
+            beginVanilla(state, player, changedStack, rawCount, indexFallback);
+            return false;
+        }
+
+        state.optimizing = true;
+        long started = stats.enabled() ? System.nanoTime() : 0L;
+        startPredicateScope(state);
         int candidateCount = rawCount;
         try {
-            int full = 0;
-            int empty = 0;
-            int occupied = 0;
-            for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
-                ItemStack stack = inventory.getItem(slot);
-                if (stack.isEmpty()) {
-                    empty++;
-                } else {
-                    occupied++;
-                    if (stack.getCount() >= stack.getMaxStackSize()) full++;
-                }
-            }
-
             List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> awards;
             long tick = player.getServer().getTickCount();
             synchronized (index) {
@@ -160,25 +203,20 @@ public final class InventoryAdvancementRuntime {
                         InvAdvOptConfig.PERIODIC_FULL_SCAN_TICKS.get());
                 rawCount = selection.allListeners().size();
                 candidateCount = selection.candidates().size();
-                if (selection.disabled()) {
-                    return fallThroughFromOptimized(state, player, changedStack, rawCount, "player_index_disabled", started);
-                }
-                if (selection.unsafe() && (mode() == OptimizationMode.EXACT || InvAdvOptConfig.FALLBACK_ON_UNKNOWN_PREDICATE.get())) {
-                    return fallThroughFromOptimized(state, player, changedStack, rawCount, "unknown_or_incomplete_index", started);
-                }
-
-                boolean sampleVerify = selection.verify()
-                        || ThreadLocalRandom.current().nextDouble() < InvAdvOptConfig.SHADOW_VERIFY_RATE.get();
+                double shadowVerifyRate = InvAdvOptConfig.SHADOW_VERIFY_RATE.get();
+                boolean sampleVerify = selection.verify() || shadowVerifyRate > 0.0D
+                        && ThreadLocalRandom.current().nextDouble() < shadowVerifyRate;
                 if (selection.mandatoryFull()) stats.recordFullScan();
-                LootContext context = EntityPredicate.createContext(player, player);
+                state.matchContext.reset(player);
                 List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> optimizedMatches =
-                        evaluate(selection.candidates(), inventory, changedStack, full, empty, occupied, context);
+                        evaluate(selection.candidates(), inventory, changedStack, selection.fullSlots(), selection.emptySlots(),
+                                selection.occupiedSlots(), state.matchContext);
                 awards = optimizedMatches;
 
                 if (sampleVerify && !selection.mandatoryFull()) {
                     stats.recordFullScan();
-                    Verification verification = verifyFull(selection.allListeners(), selection.candidates(), optimizedMatches,
-                            inventory, changedStack, full, empty, occupied, context);
+                    Verification verification = verifyFull(selection, optimizedMatches, inventory, changedStack,
+                            selection.fullSlots(), selection.emptySlots(), selection.occupiedSlots(), state.matchContext);
                     index.verified(tick);
                     if (!verification.matches()) {
                         awards = verification.fullMatches();
@@ -196,70 +234,69 @@ public final class InventoryAdvancementRuntime {
                     listener.run(player.getAdvancements());
                 }
             }
-            stats.recordTrigger(player, changedStack, rawCount, candidateCount, System.nanoTime() - started);
+            stats.recordTrigger(player, changedStack, rawCount, candidateCount,
+                    started == 0L ? 0L : System.nanoTime() - started);
             return true;
         } catch (Throwable throwable) {
             LOGGER.error("[invadvopt] Optimized trigger failed safely for player {} and item {}; retrying through vanilla.",
                     player.getUUID(), safeItemName(changedStack), throwable);
             return fallThroughFromOptimized(state, player, changedStack, rawCount, "optimization_exception", started);
         } finally {
+            state.matchContext.clear();
             if (state.optimizing) {
-                stats.endPredicateScope();
+                endPredicateScope(state);
                 state.optimizing = false;
             }
         }
     }
 
     private List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> evaluate(
-            Collection<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> source,
-            Inventory inventory, ItemStack changedStack, int full, int empty, int occupied, LootContext context) {
+            Iterable<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> source,
+            Inventory inventory, ItemStack changedStack, int full, int empty, int occupied, LazyMatchContext context) {
         List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> result = null;
         for (CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance> listener : source) {
-            InventoryChangeTrigger.TriggerInstance trigger = listener.trigger();
-            if (trigger.matches(inventory, changedStack, full, empty, occupied)) {
-                Optional<ContextAwarePredicate> playerPredicate = trigger.player();
-                if (playerPredicate.isEmpty() || playerPredicate.get().matches(context)) {
-                    if (result == null) result = new ArrayList<>();
-                    result.add(listener);
-                }
+            if (matches(listener, inventory, changedStack, full, empty, occupied, context)) {
+                if (result == null) result = new ArrayList<>();
+                result.add(listener);
             }
         }
         return result;
     }
 
     private Verification verifyFull(
-            List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> all,
-            List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> candidates,
+            PlayerIndex.Selection selection,
             List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> optimizedMatches,
-            Inventory inventory, ItemStack changedStack, int full, int empty, int occupied, LootContext context) {
-        Set<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> candidateSet = IdentitySet.create();
-        candidateSet.addAll(candidates);
-        Set<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> optimizedSet = IdentitySet.create();
-        if (optimizedMatches != null) optimizedSet.addAll(optimizedMatches);
-        List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> fullMatches =
-                optimizedMatches == null ? null : new ArrayList<>(optimizedMatches);
-        Set<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> fullSet = IdentitySet.create();
-        fullSet.addAll(optimizedSet);
-
-        for (CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance> listener : all) {
-            if (candidateSet.contains(listener)) continue;
-            InventoryChangeTrigger.TriggerInstance trigger = listener.trigger();
-            if (trigger.matches(inventory, changedStack, full, empty, occupied)) {
-                Optional<ContextAwarePredicate> playerPredicate = trigger.player();
-                if (playerPredicate.isEmpty() || playerPredicate.get().matches(context)) {
-                    if (fullMatches == null) fullMatches = new ArrayList<>();
-                    fullMatches.add(listener);
-                    fullSet.add(listener);
-                }
+            Inventory inventory, ItemStack changedStack, int full, int empty, int occupied, LazyMatchContext context) {
+        List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> missing = null;
+        for (CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance> listener : selection.allListeners()) {
+            if (selection.isCandidate(listener)) continue;
+            if (matches(listener, inventory, changedStack, full, empty, occupied, context)) {
+                if (missing == null) missing = new ArrayList<>();
+                missing.add(listener);
             }
         }
-        Set<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> missing = IdentitySet.create();
-        missing.addAll(fullSet);
-        missing.removeAll(optimizedSet);
-        Set<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> extra = IdentitySet.create();
-        extra.addAll(optimizedSet);
-        extra.removeAll(fullSet);
-        return new Verification(missing.isEmpty() && extra.isEmpty(), fullMatches, missing, extra);
+        if (missing == null) return MATCHED_VERIFICATION;
+
+        // Candidate listeners were matched by the original TriggerInstance above, so the
+        // complete result is exactly optimizedMatches plus any matching omitted listener.
+        // The former set-based implementation built four identity maps to derive the same
+        // result and could never produce an "extra" entry because it seeded the full set
+        // with every optimized match.
+        int optimizedSize = optimizedMatches == null ? 0 : optimizedMatches.size();
+        List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> fullMatches =
+                new ArrayList<>(optimizedSize + missing.size());
+        if (optimizedMatches != null) fullMatches.addAll(optimizedMatches);
+        fullMatches.addAll(missing);
+        return new Verification(false, fullMatches, missing, List.of());
+    }
+
+    private static boolean matches(
+            CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance> listener,
+            Inventory inventory, ItemStack changedStack, int full, int empty, int occupied, LazyMatchContext context) {
+        InventoryChangeTrigger.TriggerInstance trigger = listener.trigger();
+        if (!trigger.matches(inventory, changedStack, full, empty, occupied)) return false;
+        Optional<ContextAwarePredicate> playerPredicate = trigger.player();
+        return playerPredicate.isEmpty() || playerPredicate.get().matches(context.get());
     }
 
     private void onMismatch(PlayerIndex index, ServerPlayer player, ItemStack stack, PlayerIndex.Selection selection, Verification result) {
@@ -275,7 +312,7 @@ public final class InventoryAdvancementRuntime {
         }
     }
 
-    private void logMismatch(String type, Set<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> listeners,
+    private void logMismatch(String type, Iterable<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> listeners,
             ServerPlayer player, ItemStack stack, PlayerIndex.Selection selection) {
         for (CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance> listener : listeners) {
             LOGGER.error("[invadvopt] Shadow mismatch type={} advancement={} criterion={} player={} item={} listenerGeneration={} registryGeneration={}",
@@ -285,44 +322,119 @@ public final class InventoryAdvancementRuntime {
     }
 
     private String unavailableReason(ServerPlayer player) {
-        if (!InvAdvOptConfig.ENABLED.get()) return "disabled_by_config";
-        if (mode() == OptimizationMode.VANILLA) return "vanilla_mode";
-        if (!replacementHealthy) return disabledReason;
         if (reloadInProgress) return "datapack_reload_in_progress";
         MinecraftServer server = player.getServer();
         if (server == null || !server.isSameThread()) return "off_thread_call";
         return null;
     }
 
+    private boolean shouldMaintainIndexes() {
+        return InvAdvOptConfig.ENABLED.get()
+                && mode() != OptimizationMode.VANILLA
+                && (!selfCheckCompleted || replacementHealthy);
+    }
+
+    private void suspendIndexMaintenance() {
+        if (indexMaintenanceSuspended) return;
+        synchronized (indexes) {
+            if (indexMaintenanceSuspended) return;
+            indexes.clear();
+            indexMaintenanceSuspended = true;
+        }
+    }
+
+    /** Must be called while holding {@link #indexes}. */
+    private boolean resumeIndexMaintenance() {
+        if (!indexMaintenanceSuspended) return false;
+        indexes.clear();
+        indexMaintenanceSuspended = false;
+        return true;
+    }
+
+    private PlayerIndex rebuildIndex(InventoryChangeTrigger trigger, PlayerAdvancements advancements) {
+        try {
+            PlayerIndex index = new PlayerIndex();
+            int unsafePlans = index.replaceAll(currentListeners(trigger, advancements), registryGeneration.get());
+            stats.recordIndexCondition("unsafe_plan", unsafePlans);
+            indexes.put(advancements, index);
+            listenerAccessFailureLogged = false;
+            return index;
+        } catch (RuntimeException | LinkageError exception) {
+            if (!listenerAccessFailureLogged) {
+                listenerAccessFailureLogged = true;
+                LOGGER.error("[invadvopt] Could not rebuild the inventory advancement listener index; vanilla behavior is retained.", exception);
+            }
+            return null;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> currentListeners(
+            InventoryChangeTrigger trigger, PlayerAdvancements advancements) {
+        Set<CriterionTrigger.Listener<?>> source = ((SimpleCriterionTriggerAccessor)(Object)trigger)
+                .invadvopt$getPlayers().get(advancements);
+        if (source == null || source.isEmpty()) return List.of();
+        List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> result = new ArrayList<>(source.size());
+        for (CriterionTrigger.Listener<?> listener : source) {
+            result.add((CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>)listener);
+        }
+        return result;
+    }
+
     private boolean fallThroughFromOptimized(ProcessingState state, ServerPlayer player, ItemStack stack,
             int rawCount, String reason, long started) {
-        stats.endPredicateScope();
+        endPredicateScope(state);
         state.optimizing = false;
         beginVanilla(state, player, stack, rawCount, reason, started);
         return false;
     }
 
     private void beginVanilla(ProcessingState state, ServerPlayer player, ItemStack stack, int rawCount, String reason) {
-        beginVanilla(state, player, stack, rawCount, reason, System.nanoTime());
+        beginVanilla(state, player, stack, rawCount, reason, stats.enabled() ? System.nanoTime() : 0L);
     }
 
     private void beginVanilla(ProcessingState state, ServerPlayer player, ItemStack stack, int rawCount, String reason, long started) {
         stats.recordFallback(reason);
-        stats.startPredicateScope();
-        state.vanillaFrames.push(new VanillaFrame(player, stack, rawCount, reason, started));
+        boolean trackPredicates = !"index_desynchronized".equals(reason);
+        if (trackPredicates) startPredicateScope(state);
+        state.vanillaFrames.push(new VanillaFrame(player, stack, rawCount, reason, started, trackPredicates));
     }
 
     public void onVanillaTriggerReturn() {
         ProcessingState state = processing.get();
         VanillaFrame frame = state.vanillaFrames.poll();
         if (frame == null) return;
-        stats.endPredicateScope();
-        stats.recordTrigger(frame.player(), frame.stack(), frame.rawListeners(), frame.rawListeners(), System.nanoTime() - frame.started());
+        if (frame.trackPredicates()) endPredicateScope(state);
+        stats.recordTrigger(frame.player(), frame.stack(), frame.rawListeners(), frame.rawListeners(),
+                frame.started() == 0L ? 0L : System.nanoTime() - frame.started());
         if (state.vanillaFrames.isEmpty() && !state.optimizing) processing.remove();
     }
 
     public void onItemPredicateTest() {
-        stats.onItemPredicateTest();
+        if (activePredicateScopes.get() <= 0) return;
+        ProcessingState state = processing.get();
+        if (state.predicateScopeDepth > 0) {
+            state.predicateTests++;
+        } else {
+            processing.remove();
+        }
+    }
+
+    private void startPredicateScope(ProcessingState state) {
+        if (!stats.enabled()) return;
+        if (state.predicateScopeDepth++ == 0) {
+            state.predicateTests = 0L;
+            activePredicateScopes.incrementAndGet();
+        }
+    }
+
+    private void endPredicateScope(ProcessingState state) {
+        if (state.predicateScopeDepth <= 0) return;
+        if (--state.predicateScopeDepth == 0) {
+            stats.recordPredicateTests(state.predicateTests);
+            state.predicateTests = 0L;
+            if (activePredicateScopes.decrementAndGet() < 0) activePredicateScopes.set(0);
+        }
     }
 
     public void reloadStarted() {
@@ -343,8 +455,12 @@ public final class InventoryAdvancementRuntime {
 
     private void reloadCompleted() {
         long generation = registryGeneration.incrementAndGet();
-        synchronized (indexes) {
-            for (PlayerIndex index : indexes.values()) index.markReload(generation);
+        if (shouldMaintainIndexes()) {
+            synchronized (indexes) {
+                for (PlayerIndex index : indexes.values()) index.markReload(generation);
+            }
+        } else {
+            suspendIndexMaintenance();
         }
         reloadInProgress = false;
     }
@@ -357,7 +473,8 @@ public final class InventoryAdvancementRuntime {
 
     public void resetPlayerCircuitBreakers() {
         synchronized (indexes) {
-            for (PlayerIndex index : indexes.values()) index.enable();
+            indexes.clear();
+            indexMaintenanceSuspended = true;
         }
         consecutiveMismatches = 0;
     }
@@ -365,11 +482,13 @@ public final class InventoryAdvancementRuntime {
     public void clear() {
         synchronized (indexes) { indexes.clear(); }
         reloadInProgress = false;
+        activePredicateScopes.set(0);
         processing.remove();
     }
 
     public void setMode(OptimizationMode mode) {
         commandMode = mode;
+        if (mode == OptimizationMode.VANILLA) suspendIndexMaintenance();
         if (mode != OptimizationMode.VANILLA && replacementHealthy) disabledReason = "none";
     }
 
@@ -381,7 +500,8 @@ public final class InventoryAdvancementRuntime {
     public String status() {
         return "mode=" + mode() + ", enabled=" + InvAdvOptConfig.ENABLED.get() + ", replacementHealthy=" + replacementHealthy
                 + ", reloadInProgress=" + reloadInProgress + ", registryGeneration=" + registryGeneration.get()
-                + ", indexedPlayers=" + indexedPlayers() + ", disabledReason=" + disabledReason;
+                + ", indexedPlayers=" + indexedPlayers() + ", indexMaintenanceSuspended=" + indexMaintenanceSuspended
+                + ", disabledReason=" + disabledReason;
     }
 
     public int indexedPlayers() {
@@ -405,13 +525,37 @@ public final class InventoryAdvancementRuntime {
 
     private static final class ProcessingState {
         private boolean optimizing;
+        private int predicateScopeDepth;
+        private long predicateTests;
+        private final LazyMatchContext matchContext = new LazyMatchContext();
         private final Deque<VanillaFrame> vanillaFrames = new ArrayDeque<>();
     }
 
-    private record VanillaFrame(ServerPlayer player, ItemStack stack, int rawListeners, String reason, long started) {}
+    private static final class LazyMatchContext {
+        private ServerPlayer player;
+        private LootContext context;
+
+        private void reset(ServerPlayer player) {
+            this.player = player;
+            context = null;
+        }
+
+        private LootContext get() {
+            if (context == null) context = EntityPredicate.createContext(player, player);
+            return context;
+        }
+
+        private void clear() {
+            player = null;
+            context = null;
+        }
+    }
+
+    private record VanillaFrame(ServerPlayer player, ItemStack stack, int rawListeners, String reason, long started,
+            boolean trackPredicates) {}
 
     private record Verification(boolean matches,
             List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> fullMatches,
-            Set<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> missing,
-            Set<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> extra) {}
+            List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> missing,
+            List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> extra) {}
 }

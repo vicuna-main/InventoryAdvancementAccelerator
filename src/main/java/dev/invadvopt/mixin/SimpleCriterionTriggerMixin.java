@@ -15,14 +15,14 @@ abstract class SimpleCriterionTriggerMixin {
     @Inject(method = "addPlayerListener(Lnet/minecraft/server/PlayerAdvancements;Lnet/minecraft/advancements/CriterionTrigger$Listener;)V", at = @At("TAIL"), require = 0)
     private void invadvopt$onListenerAdded(PlayerAdvancements advancements, CriterionTrigger.Listener<?> listener, CallbackInfo callback) {
         if ((Object)this instanceof InventoryChangeTrigger) {
-            InvAdvOpt.RUNTIME.addListener(advancements, listener);
+            InvAdvOpt.RUNTIME.addListener((InventoryChangeTrigger)(Object)this, advancements, listener);
         }
     }
 
     @Inject(method = "removePlayerListener(Lnet/minecraft/server/PlayerAdvancements;Lnet/minecraft/advancements/CriterionTrigger$Listener;)V", at = @At("TAIL"), require = 0)
     private void invadvopt$onListenerRemoved(PlayerAdvancements advancements, CriterionTrigger.Listener<?> listener, CallbackInfo callback) {
         if ((Object)this instanceof InventoryChangeTrigger) {
-            InvAdvOpt.RUNTIME.removeListener(advancements, listener);
+            InvAdvOpt.RUNTIME.removeListener((InventoryChangeTrigger)(Object)this, advancements, listener);
         }
     }
 
