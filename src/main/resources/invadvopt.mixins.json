@@ -1,0 +1,18 @@
+{
+  "required": false,
+  "minVersion": "0.8.7",
+  "package": "dev.invadvopt.mixin",
+  "plugin": "dev.invadvopt.mixin.InventoryAdvancementMixinPlugin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "InventoryChangeTriggerMixin",
+    "ItemPredicateMixin",
+    "MinecraftServerReloadMixin",
+    "SimpleCriterionTriggerMixin"
+  ],
+  "client": [],
+  "server": [],
+  "injectors": {
+    "defaultRequire": 0
+  }
+}
