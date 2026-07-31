@@ -2,12 +2,14 @@ package dev.invadvopt;
 
 import com.mojang.logging.LogUtils;
 import dev.invadvopt.config.InvAdvOptConfig;
+import dev.invadvopt.index.PlanCompiler;
 import dev.invadvopt.index.PlayerIndex;
 import dev.invadvopt.metrics.StatsCollector;
 import dev.invadvopt.mixin.SimpleCriterionTriggerAccessor;
 import java.lang.reflect.Method;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.IdentityHashMap;
 import java.util.List;
@@ -19,6 +21,7 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import net.minecraft.advancements.CriterionTrigger;
+import net.minecraft.advancements.CriteriaTriggers;
 import net.minecraft.advancements.critereon.ContextAwarePredicate;
 import net.minecraft.advancements.critereon.EntityPredicate;
 import net.minecraft.advancements.critereon.InventoryChangeTrigger;
@@ -37,10 +40,15 @@ public final class InventoryAdvancementRuntime {
     private static final Logger LOGGER = LogUtils.getLogger();
     private static final Set<String> CONFLICTING_MODS = Set.of("achiopt", "cerulean", "icterine");
     private static final int GLOBAL_MISMATCH_THRESHOLD = 3;
+    private static final int MAX_PENDING_WARMUPS = 1024;
     private static final Verification MATCHED_VERIFICATION =
             new Verification(true, null, List.of(), List.of());
 
     private final Map<PlayerAdvancements, PlayerIndex> indexes = new IdentityHashMap<>();
+    private final Deque<PlayerAdvancements> pendingWarmups = new ArrayDeque<>();
+    private final Set<PlayerAdvancements> pendingWarmupSet =
+            Collections.newSetFromMap(new IdentityHashMap<>());
+    private final PlanCompiler planCompiler = new PlanCompiler();
     private final AtomicLong registryGeneration = new AtomicLong();
     private final AtomicInteger activePredicateScopes = new AtomicInteger();
     private final StatsCollector stats = new StatsCollector();
@@ -54,6 +62,7 @@ public final class InventoryAdvancementRuntime {
     private volatile boolean listenerAccessFailureLogged;
     private volatile String disabledReason = "server_not_started";
     private int consecutiveMismatches;
+    private WarmupTask activeWarmup;
 
     public void startupSelfCheck() {
         stats.setEnabled(InvAdvOptConfig.METRICS_ENABLED.get());
@@ -72,6 +81,9 @@ public final class InventoryAdvancementRuntime {
             if (!Boolean.getBoolean("invadvopt.mixin." + hook)) missingHooks.add(hook);
         }
         if (!verifyVanillaDescriptors()) missingHooks.add("vanilla_descriptors");
+        if (!((Object)CriteriaTriggers.INVENTORY_CHANGED instanceof SimpleCriterionTriggerAccessor)) {
+            missingHooks.add("listener_accessor");
+        }
         if (!missingHooks.isEmpty()) {
             replacementHealthy = false;
             selfCheckCompleted = true;
@@ -83,6 +95,9 @@ public final class InventoryAdvancementRuntime {
         replacementHealthy = true;
         selfCheckCompleted = true;
         disabledReason = "none";
+        if (!Boolean.getBoolean("invadvopt.mixin.bulk")) {
+            LOGGER.warn("[invadvopt] Bulk-registration warmup hook is unavailable; indexes will warm safely after the first trigger.");
+        }
         LOGGER.info("[invadvopt] EXACT inventory advancement acceleration is ready (registry generation {}).", registryGeneration.get());
     }
 
@@ -109,12 +124,11 @@ public final class InventoryAdvancementRuntime {
         CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance> typed =
                 (CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>) listener;
         synchronized (indexes) {
-            if (resumeIndexMaintenance()) {
-                rebuildIndex(trigger, advancements);
-                return;
-            }
-            PlayerIndex.AddResult result = indexes.computeIfAbsent(advancements, ignored -> new PlayerIndex())
-                    .add(typed, registryGeneration.get());
+            resumeIndexMaintenance();
+            invalidateActiveWarmup(advancements, true);
+            PlayerIndex index = indexes.get(advancements);
+            if (index == null) return;
+            PlayerIndex.AddResult result = index.add(typed, registryGeneration.get());
             if (result == PlayerIndex.AddResult.ADDED_UNSAFE_PLAN) {
                 stats.recordIndexCondition("unsafe_plan");
             }
@@ -128,15 +142,10 @@ public final class InventoryAdvancementRuntime {
             return;
         }
         synchronized (indexes) {
-            if (resumeIndexMaintenance()) {
-                rebuildIndex(trigger, advancements);
-                return;
-            }
+            resumeIndexMaintenance();
+            invalidateActiveWarmup(advancements, true);
             PlayerIndex index = indexes.get(advancements);
-            if (index == null) {
-                rebuildIndex(trigger, advancements);
-                return;
-            }
+            if (index == null) return;
             if (!index.remove((CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>) listener)) {
                 stats.recordIndexCondition("remove_miss");
             }
@@ -150,6 +159,21 @@ public final class InventoryAdvancementRuntime {
         }
         synchronized (indexes) {
             indexes.remove(advancements);
+            cancelWarmup(advancements);
+        }
+    }
+
+    /** Called after vanilla has completed a full listener registration pass. */
+    public void listenersRegistered(PlayerAdvancements advancements) {
+        if (!shouldMaintainIndexes()) {
+            suspendIndexMaintenance();
+            return;
+        }
+        synchronized (indexes) {
+            resumeIndexMaintenance();
+            indexes.remove(advancements);
+            cancelWarmup(advancements);
+            queueWarmup(advancements);
         }
     }
 
@@ -176,11 +200,11 @@ public final class InventoryAdvancementRuntime {
             resumeIndexMaintenance();
             index = indexes.get(player.getAdvancements());
             if (index == null) {
-                index = rebuildIndex(trigger, player.getAdvancements());
+                queueWarmup(player.getAdvancements());
             }
         }
         if (index == null) {
-            beginVanilla(state, player, changedStack, 0, "index_missing");
+            beginVanilla(state, player, changedStack, 0, "index_warming");
             return false;
         }
 
@@ -339,32 +363,128 @@ public final class InventoryAdvancementRuntime {
         synchronized (indexes) {
             if (indexMaintenanceSuspended) return;
             indexes.clear();
+            pendingWarmups.clear();
+            pendingWarmupSet.clear();
+            activeWarmup = null;
+            planCompiler.clear();
             indexMaintenanceSuspended = true;
         }
     }
 
     /** Must be called while holding {@link #indexes}. */
-    private boolean resumeIndexMaintenance() {
-        if (!indexMaintenanceSuspended) return false;
+    private void resumeIndexMaintenance() {
+        if (!indexMaintenanceSuspended) return;
         indexes.clear();
         indexMaintenanceSuspended = false;
-        return true;
     }
 
-    private PlayerIndex rebuildIndex(InventoryChangeTrigger trigger, PlayerAdvancements advancements) {
+    public void processIndexWarmups(MinecraftServer server) {
+        if (server == null || !server.isSameThread() || reloadInProgress) return;
+        if (!shouldMaintainIndexes()) {
+            suspendIndexMaintenance();
+            return;
+        }
+        long budgetNanos = InvAdvOptConfig.INDEX_WARMUP_BUDGET_MICROS.get() * 1_000L;
+        long deadline = System.nanoTime() + budgetNanos;
+        synchronized (indexes) {
+            resumeIndexMaintenance();
+            try {
+                do {
+                    if (activeWarmup == null) {
+                        PlayerAdvancements advancements = pollWarmup();
+                        if (advancements == null) return;
+                        List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> listeners =
+                                currentListeners(CriteriaTriggers.INVENTORY_CHANGED, advancements);
+                        long generation = registryGeneration.get();
+                        activeWarmup = new WarmupTask(
+                                advancements,
+                                PlayerIndex.builder(planCompiler, listeners, generation),
+                                generation);
+                    }
+
+                    int compiled = 0;
+                    while (compiled < 16 && activeWarmup.builder().addNext()) compiled++;
+                    if (activeWarmup.builder().complete()) {
+                        publishWarmup(activeWarmup);
+                        activeWarmup = null;
+                    }
+                } while (System.nanoTime() < deadline);
+            } catch (RuntimeException | LinkageError exception) {
+                PlayerAdvancements failed = activeWarmup == null ? null : activeWarmup.advancements();
+                activeWarmup = null;
+                if (!listenerAccessFailureLogged) {
+                    listenerAccessFailureLogged = true;
+                    LOGGER.error("[invadvopt] Could not warm the inventory advancement listener index; vanilla behavior is retained.", exception);
+                }
+                if (failed != null) indexes.remove(failed);
+            }
+        }
+    }
+
+    private void publishWarmup(WarmupTask task) {
+        if (task.registryGeneration() != registryGeneration.get()) {
+            requeueWarmup(task.advancements());
+            return;
+        }
         try {
-            PlayerIndex index = new PlayerIndex();
-            int unsafePlans = index.replaceAll(currentListeners(trigger, advancements), registryGeneration.get());
-            stats.recordIndexCondition("unsafe_plan", unsafePlans);
-            indexes.put(advancements, index);
+            List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> authoritative =
+                    currentListeners(CriteriaTriggers.INVENTORY_CHANGED, task.advancements());
+            if (!sameListeners(authoritative, task.builder())) {
+                requeueWarmup(task.advancements());
+                return;
+            }
+            PlayerIndex index = task.builder().finish();
+            stats.recordIndexCondition("unsafe_plan", task.builder().unsafePlans());
+            stats.recordIndexCondition("warmup_completed");
+            stats.recordIndexCondition("warmup_listeners", task.builder().sourceSize());
+            indexes.put(task.advancements(), index);
             listenerAccessFailureLogged = false;
-            return index;
         } catch (RuntimeException | LinkageError exception) {
             if (!listenerAccessFailureLogged) {
                 listenerAccessFailureLogged = true;
-                LOGGER.error("[invadvopt] Could not rebuild the inventory advancement listener index; vanilla behavior is retained.", exception);
+                LOGGER.error("[invadvopt] Could not publish the inventory advancement listener index; vanilla behavior is retained.", exception);
             }
-            return null;
+            indexes.remove(task.advancements());
+        }
+    }
+
+    private static boolean sameListeners(
+            List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> authoritative,
+            PlayerIndex.Builder builder) {
+        // The vanilla set is authoritative. A generation-free final equality check prevents a
+        // bypassing mixin from causing a stale private build to become visible.
+        return builder.matches(authoritative);
+    }
+
+    private void queueWarmup(PlayerAdvancements advancements) {
+        if (indexes.containsKey(advancements)) return;
+        if (activeWarmup != null && activeWarmup.advancements() == advancements) return;
+        if (pendingWarmupSet.size() >= MAX_PENDING_WARMUPS) return;
+        if (pendingWarmupSet.add(advancements)) pendingWarmups.addLast(advancements);
+    }
+
+    private void requeueWarmup(PlayerAdvancements advancements) {
+        if (pendingWarmupSet.size() >= MAX_PENDING_WARMUPS) return;
+        if (pendingWarmupSet.add(advancements)) pendingWarmups.addLast(advancements);
+    }
+
+    private PlayerAdvancements pollWarmup() {
+        while (!pendingWarmups.isEmpty()) {
+            PlayerAdvancements advancements = pendingWarmups.removeFirst();
+            if (pendingWarmupSet.remove(advancements)) return advancements;
+        }
+        return null;
+    }
+
+    private void cancelWarmup(PlayerAdvancements advancements) {
+        pendingWarmupSet.remove(advancements);
+        if (activeWarmup != null && activeWarmup.advancements() == advancements) activeWarmup = null;
+    }
+
+    private void invalidateActiveWarmup(PlayerAdvancements advancements, boolean requeue) {
+        if (activeWarmup != null && activeWarmup.advancements() == advancements) {
+            activeWarmup = null;
+            if (requeue) queueWarmup(advancements);
         }
     }
 
@@ -454,10 +574,19 @@ public final class InventoryAdvancementRuntime {
     }
 
     private void reloadCompleted() {
-        long generation = registryGeneration.incrementAndGet();
+        registryGeneration.incrementAndGet();
         if (shouldMaintainIndexes()) {
             synchronized (indexes) {
-                for (PlayerIndex index : indexes.values()) index.markReload(generation);
+                Set<PlayerAdvancements> rebuild = Collections.newSetFromMap(new IdentityHashMap<>());
+                rebuild.addAll(indexes.keySet());
+                rebuild.addAll(pendingWarmupSet);
+                if (activeWarmup != null) rebuild.add(activeWarmup.advancements());
+                indexes.clear();
+                pendingWarmups.clear();
+                pendingWarmupSet.clear();
+                activeWarmup = null;
+                planCompiler.clear();
+                for (PlayerAdvancements advancements : rebuild) queueWarmup(advancements);
             }
         } else {
             suspendIndexMaintenance();
@@ -474,13 +603,22 @@ public final class InventoryAdvancementRuntime {
     public void resetPlayerCircuitBreakers() {
         synchronized (indexes) {
             indexes.clear();
+            pendingWarmups.clear();
+            pendingWarmupSet.clear();
+            activeWarmup = null;
             indexMaintenanceSuspended = true;
         }
         consecutiveMismatches = 0;
     }
 
     public void clear() {
-        synchronized (indexes) { indexes.clear(); }
+        synchronized (indexes) {
+            indexes.clear();
+            pendingWarmups.clear();
+            pendingWarmupSet.clear();
+            activeWarmup = null;
+            planCompiler.clear();
+        }
         reloadInProgress = false;
         activePredicateScopes.set(0);
         processing.remove();
@@ -498,14 +636,22 @@ public final class InventoryAdvancementRuntime {
     }
 
     public String status() {
+        PlanCompiler.CacheStats planCache = planCompiler.cacheStats();
         return "mode=" + mode() + ", enabled=" + InvAdvOptConfig.ENABLED.get() + ", replacementHealthy=" + replacementHealthy
                 + ", reloadInProgress=" + reloadInProgress + ", registryGeneration=" + registryGeneration.get()
                 + ", indexedPlayers=" + indexedPlayers() + ", indexMaintenanceSuspended=" + indexMaintenanceSuspended
-                + ", disabledReason=" + disabledReason;
+                + ", pendingWarmups=" + pendingWarmupCount() + ", planCache=" + planCache.size()
+                + "/" + planCache.hits() + "/" + planCache.misses() + ", disabledReason=" + disabledReason;
     }
 
     public int indexedPlayers() {
         synchronized (indexes) { return indexes.size(); }
+    }
+
+    private int pendingWarmupCount() {
+        synchronized (indexes) {
+            return pendingWarmupSet.size() + (activeWarmup == null ? 0 : 1);
+        }
     }
 
     public StatsCollector stats() {
@@ -558,4 +704,10 @@ public final class InventoryAdvancementRuntime {
             List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> fullMatches,
             List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> missing,
             List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> extra) {}
+
+    private record WarmupTask(
+            PlayerAdvancements advancements,
+            PlayerIndex.Builder builder,
+            long registryGeneration) {
+    }
 }

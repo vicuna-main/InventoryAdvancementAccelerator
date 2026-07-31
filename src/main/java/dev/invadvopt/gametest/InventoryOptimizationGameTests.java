@@ -2,6 +2,7 @@ package dev.invadvopt.gametest;
 
 import dev.invadvopt.InvAdvOpt;
 import dev.invadvopt.index.InventorySnapshot;
+import dev.invadvopt.index.PlanCompiler;
 import dev.invadvopt.index.PlayerIndex;
 import java.util.HashSet;
 import java.util.List;
@@ -178,11 +179,61 @@ public final class InventoryOptimizationGameTests {
         helper.succeed();
     }
 
+    @GameTest(template = "empty", timeoutTicks = 40)
+    public static void privateBuilderPublishesOnlyACompleteAuthoritativeIndex(GameTestHelper helper) {
+        PlanCompiler compiler = new PlanCompiler();
+        InventoryChangeTrigger.TriggerInstance trigger = trigger(Items.DIAMOND);
+        CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance> first = listener("builder_first", trigger);
+        CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance> second = listener("builder_second", trigger);
+        PlayerIndex.Builder builder = PlayerIndex.builder(compiler, List.of(first, second), 7L);
+
+        helper.assertTrue(builder.addNext() && !builder.complete(), "builder completed before consuming its source");
+        boolean rejectedPartialPublish = false;
+        try {
+            builder.finish();
+        } catch (IllegalStateException expected) {
+            rejectedPartialPublish = true;
+        }
+        helper.assertTrue(rejectedPartialPublish, "partially built index was publishable");
+        helper.assertTrue(builder.addNext() && builder.complete(), "builder did not consume its complete source");
+        helper.assertTrue(builder.matches(List.of(second, first)), "authoritative listener comparison was order-sensitive");
+
+        PlayerIndex index = builder.finish();
+        helper.assertTrue(index.listenerCount() == 2, "published index lost listeners");
+        PlanCompiler.CacheStats cache = compiler.cacheStats();
+        helper.assertTrue(cache.misses() == 1L && cache.hits() == 1L && cache.size() == 1,
+                "player-independent trigger plan was not reused");
+        helper.succeed();
+    }
+
+    @GameTest(template = "empty", timeoutTicks = 40)
+    public static void privateBuilderRejectsChangedAuthoritativeListeners(GameTestHelper helper) {
+        PlanCompiler compiler = new PlanCompiler();
+        CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance> original =
+                listener("builder_changed", trigger(Items.DIAMOND));
+        CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance> replacement =
+                listener("builder_changed", trigger(Items.APPLE));
+        PlayerIndex.Builder builder = PlayerIndex.builder(compiler, List.of(original), 0L);
+        builder.addNext();
+
+        helper.assertTrue(!builder.matches(List.of(replacement)),
+                "changed authoritative trigger was accepted by the private build");
+        helper.succeed();
+    }
+
     private static CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance> listener(String path, Item item) {
+        return listener(path, trigger(item));
+    }
+
+    private static InventoryChangeTrigger.TriggerInstance trigger(Item item) {
         ItemPredicate predicate = new ItemPredicate(Optional.of(HolderSet.direct(item.builtInRegistryHolder())),
                 MinMaxBounds.Ints.ANY, DataComponentPredicate.EMPTY, Map.of());
-        InventoryChangeTrigger.TriggerInstance trigger = new InventoryChangeTrigger.TriggerInstance(
+        return new InventoryChangeTrigger.TriggerInstance(
                 Optional.empty(), InventoryChangeTrigger.TriggerInstance.Slots.ANY, List.of(predicate));
+    }
+
+    private static CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance> listener(
+            String path, InventoryChangeTrigger.TriggerInstance trigger) {
         Advancement advancement = new Advancement(Optional.empty(), Optional.empty(), AdvancementRewards.EMPTY,
                 Map.of(), AdvancementRequirements.EMPTY, false);
         AdvancementHolder holder = new AdvancementHolder(

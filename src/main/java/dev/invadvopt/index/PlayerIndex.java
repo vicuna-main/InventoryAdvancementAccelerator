@@ -13,6 +13,7 @@ import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.item.ItemStack;
 
 public final class PlayerIndex {
+    private final PlanCompiler planCompiler;
     private final IdentityHashMap<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>, CompiledPlan> plans = new IdentityHashMap<>();
     private final Map<ListenerKey, CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> canonicalListeners = new HashMap<>();
     private final IdentityHashMap<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>, Integer> listenerPositions = new IdentityHashMap<>();
@@ -34,6 +35,14 @@ public final class PlayerIndex {
     private boolean disabled;
     private boolean forceVerification;
 
+    public PlayerIndex() {
+        this(new PlanCompiler());
+    }
+
+    public PlayerIndex(PlanCompiler planCompiler) {
+        this.planCompiler = java.util.Objects.requireNonNull(planCompiler, "planCompiler");
+    }
+
     public synchronized AddResult add(CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance> listener, long currentRegistryGeneration) {
         if (registryGeneration != currentRegistryGeneration || compiledListenerGeneration != listenerGeneration) {
             rebuild(currentRegistryGeneration);
@@ -47,7 +56,7 @@ public final class PlayerIndex {
         listenerPositions.put(listener, listeners.size());
         listeners.add(listener);
         listenerGeneration++;
-        CompiledPlan plan = PlanCompiler.compile(listener);
+        CompiledPlan plan = planCompiler.compile(listener, currentRegistryGeneration);
         plans.put(listener, plan);
         addToIndexes(plan);
         // A newly registered criterion may match an item which was already present. Only
@@ -84,7 +93,7 @@ public final class PlayerIndex {
             if (canonicalListeners.putIfAbsent(key(listener), listener) != null) continue;
             listenerPositions.put(listener, listeners.size());
             listeners.add(listener);
-            CompiledPlan plan = PlanCompiler.compile(listener);
+            CompiledPlan plan = planCompiler.compile(listener, currentRegistryGeneration);
             plans.put(listener, plan);
             addToIndexes(plan);
             if (!plan.indexSafe()) unsafePlans++;
@@ -148,12 +157,6 @@ public final class PlayerIndex {
         lastVerifiedTick = tick;
     }
 
-    public synchronized void markReload(long newRegistryGeneration) {
-        registryGeneration = newRegistryGeneration - 1L;
-        snapshot.invalidate();
-        forceVerification = true;
-    }
-
     public synchronized void requestVerification() {
         forceVerification = true;
     }
@@ -177,7 +180,7 @@ public final class PlayerIndex {
         wildcard.clear();
         slotSensitive.clear();
         for (CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance> listener : listeners) {
-            CompiledPlan plan = PlanCompiler.compile(listener);
+            CompiledPlan plan = planCompiler.compile(listener, currentRegistryGeneration);
             plans.put(listener, plan);
             addToIndexes(plan);
         }
@@ -243,6 +246,93 @@ public final class PlayerIndex {
             if (candidateSet.add(listener)) {
                 candidates.add(listener);
             }
+        }
+    }
+
+    /**
+     * Builds a new index without publishing partially populated state. The builder is intentionally
+     * single-threaded; callers may advance it in bounded server-thread slices.
+     */
+    public static Builder builder(
+            PlanCompiler planCompiler,
+            List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> listeners,
+            long registryGeneration) {
+        return new Builder(planCompiler, List.copyOf(listeners), registryGeneration);
+    }
+
+    public static final class Builder {
+        private final PlayerIndex index;
+        private final List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> source;
+        private final long registryGeneration;
+        private int position;
+        private int unsafePlans;
+        private boolean finished;
+
+        private Builder(
+                PlanCompiler planCompiler,
+                List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> source,
+                long registryGeneration) {
+            this.index = new PlayerIndex(planCompiler);
+            this.source = source;
+            this.registryGeneration = registryGeneration;
+        }
+
+        public boolean addNext() {
+            if (finished || position >= source.size()) {
+                return false;
+            }
+            CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance> listener = source.get(position++);
+            if (index.canonicalListeners.putIfAbsent(key(listener), listener) == null) {
+                index.listenerPositions.put(listener, index.listeners.size());
+                index.listeners.add(listener);
+                CompiledPlan plan = index.planCompiler.compile(listener, registryGeneration);
+                index.plans.put(listener, plan);
+                index.addToIndexes(plan);
+                if (!plan.indexSafe()) unsafePlans++;
+            }
+            return true;
+        }
+
+        public boolean complete() {
+            return position >= source.size();
+        }
+
+        public int sourceSize() {
+            return source.size();
+        }
+
+        public int unsafePlans() {
+            return unsafePlans;
+        }
+
+        public boolean matches(
+                List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> authoritative) {
+            if (authoritative.size() != index.canonicalListeners.size()) return false;
+            for (CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance> listener : authoritative) {
+                CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance> expected =
+                        index.canonicalListeners.get(key(listener));
+                if (expected == null
+                        || expected.advancement() != listener.advancement()
+                        || expected.trigger() != listener.trigger()) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        public PlayerIndex finish() {
+            if (!complete()) {
+                throw new IllegalStateException("Cannot publish a partially built player index");
+            }
+            if (!finished) {
+                index.listenerGeneration++;
+                index.compiledListenerGeneration = index.listenerGeneration;
+                index.registryGeneration = registryGeneration;
+                index.snapshot.invalidate();
+                index.forceVerification = true;
+                finished = true;
+            }
+            return index;
         }
     }
 

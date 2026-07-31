@@ -53,6 +53,7 @@ public final class InventoryAdvancementMixinPlugin implements IMixinConfigPlugin
             case "net.minecraft.advancements.critereon.InventoryChangeTrigger" -> "trigger";
             case "net.minecraft.advancements.critereon.ItemPredicate" -> "predicate";
             case "net.minecraft.server.MinecraftServer" -> "reload";
+            case "net.minecraft.server.PlayerAdvancements" -> "bulk";
             default -> null;
         };
         if (hook != null && containsInjectedCall(targetClass, "invadvopt$")) {

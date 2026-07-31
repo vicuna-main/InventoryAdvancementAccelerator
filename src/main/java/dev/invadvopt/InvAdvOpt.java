@@ -11,6 +11,7 @@ import net.neoforged.neoforge.event.RegisterCommandsEvent;
 import net.neoforged.neoforge.event.TagsUpdatedEvent;
 import net.neoforged.neoforge.event.server.ServerStartedEvent;
 import net.neoforged.neoforge.event.server.ServerStoppingEvent;
+import net.neoforged.neoforge.event.tick.ServerTickEvent;
 
 @Mod(InvAdvOpt.MOD_ID)
 public final class InvAdvOpt {
@@ -37,6 +38,11 @@ public final class InvAdvOpt {
         if (event.getUpdateCause() == TagsUpdatedEvent.UpdateCause.SERVER_DATA_LOAD && event.shouldUpdateStaticData()) {
             RUNTIME.tagsUpdated();
         }
+    }
+
+    @SubscribeEvent
+    public void onServerTick(ServerTickEvent.Post event) {
+        RUNTIME.processIndexWarmups(event.getServer());
     }
 
     @SubscribeEvent

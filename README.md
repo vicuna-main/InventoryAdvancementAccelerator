@@ -5,7 +5,7 @@
 ## Compatibility
 
 - Minecraft 1.21.1
-- NeoForge 21.1.x (compiled against 21.1.230 with Mojang mappings)
+- NeoForge 21.1.x (compiled against 21.1.235 with Mojang mappings)
 - Java 21
 - Dedicated server only; `displayTest = IGNORE_ALL_VERSION` permits vanilla clients
 - Designed to fail safely on NeoForge/Bukkit/Paper hybrids such as Youer
@@ -16,6 +16,8 @@
 ## EXACT algorithm
 
 Listener lifecycle hooks mirror only `InventoryChangeTrigger` registrations. Every `PlayerAdvancements` receives an independent identity index containing all listeners, compiled plans, direct/tag-expanded raw item IDs, wildcard/always/slot-sensitive buckets, listener and tag generations, and a 36-slot main-inventory snapshot.
+
+Full listener registration never constructs the index one listener at a time. The vanilla listener set remains authoritative while a private index is warmed in bounded server-thread slices. Triggers use vanilla until the complete source set and registry generation are revalidated and the index is atomically published. Trigger-instance plans are shared across players for one registry generation and discarded on reload.
 
 For each trigger on the server thread:
 
@@ -47,13 +49,14 @@ periodicFullScanTicks = 200
 fallbackOnUnknownPredicate = true
 fallbackOnOffThreadCall = true
 disableOnMismatch = true
+indexWarmupBudgetMicrosPerTick = 1000
 metricsEnabled = true
 debugLogging = false
 ```
 
 `AGGRESSIVE` is accepted for controlled experiments but currently uses the same no-skip engine as EXACT. It is not the default. Off-thread calls and a genuinely desynchronized index still fall through before inventory scanning. `fallbackOnUnknownPredicate` is retained for configuration compatibility; unknown plans are now evaluated from the always-check bucket and do not require a global fallback.
 
-Listener lifecycle lookup uses the stable advancement ID plus criterion name, never the listener's deep predicate hash. A removal callback for an already-absent listener is counted as `remove_miss` and ignored: because the hook runs after vanilla removal, both the vanilla set and the index are already absent for that key. Only shadow verification can classify the index as genuinely desynchronized.
+Listener lifecycle lookup uses the stable advancement ID plus criterion name, never the listener's deep predicate hash. If no complete index is active, individual registration and removal callbacks deliberately avoid materializing partial state. A removal callback for an already-absent listener is counted as `remove_miss` only when a complete index is active.
 
 ## Commands
 

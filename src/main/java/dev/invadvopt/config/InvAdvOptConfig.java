@@ -11,6 +11,7 @@ public final class InvAdvOptConfig {
     public static final ModConfigSpec.BooleanValue FALLBACK_ON_UNKNOWN_PREDICATE;
     public static final ModConfigSpec.BooleanValue FALLBACK_ON_OFF_THREAD_CALL;
     public static final ModConfigSpec.BooleanValue DISABLE_ON_MISMATCH;
+    public static final ModConfigSpec.IntValue INDEX_WARMUP_BUDGET_MICROS;
     public static final ModConfigSpec.BooleanValue METRICS_ENABLED;
     public static final ModConfigSpec.BooleanValue DEBUG_LOGGING;
 
@@ -32,6 +33,9 @@ public final class InvAdvOptConfig {
                 .define("fallbackOnOffThreadCall", true);
         DISABLE_ON_MISMATCH = builder.comment("Disable a player's index after any shadow mismatch.")
                 .define("disableOnMismatch", true);
+        INDEX_WARMUP_BUDGET_MICROS = builder.comment(
+                        "Server-wide main-thread budget used to build unpublished player indexes each tick.")
+                .defineInRange("indexWarmupBudgetMicrosPerTick", 1000, 100, 5000);
         METRICS_ENABLED = builder.define("metricsEnabled", true);
         DEBUG_LOGGING = builder.define("debugLogging", false);
         SPEC = builder.build();
