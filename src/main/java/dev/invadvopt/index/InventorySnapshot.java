@@ -1,15 +1,14 @@
 package dev.invadvopt.index;
 
+import java.util.Arrays;
 import java.util.Set;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.item.ItemStack;
 
 public final class InventorySnapshot {
-    private static final int MAX_CHANGED_RAW_IDS = Inventory.INVENTORY_SIZE * 2 + 1;
-
-    private final ItemStack[] main = new ItemStack[Inventory.INVENTORY_SIZE];
-    private final int[] changedRawIds = new int[MAX_CHANGED_RAW_IDS];
+    private ItemStack[] slots = new ItemStack[0];
+    private int[] changedRawIds = new int[1];
     private int changedRawIdCount;
     private int fullSlots;
     private int emptySlots;
@@ -32,6 +31,16 @@ public final class InventorySnapshot {
         occupiedSlots = 0;
 
         int containerSize = inventory.getContainerSize();
+        ItemStack[] previousSlots = slots;
+        if (containerSize != slots.length) {
+            // The vanilla matcher scans getContainerSize(), including armor/offhand and
+            // any extra slots supplied by a compatible Inventory implementation.
+            slots = Arrays.copyOf(slots, containerSize);
+        }
+        int requiredCapacity = Math.addExact(Math.multiplyExact(Math.max(containerSize, previousSlots.length), 2), 1);
+        if (changedRawIds.length < requiredCapacity) {
+            changedRawIds = new int[requiredCapacity];
+        }
         for (int slot = 0; slot < containerSize; slot++) {
             ItemStack current = inventory.getItem(slot);
             if (current.isEmpty()) {
@@ -41,19 +50,16 @@ public final class InventorySnapshot {
                 if (current.getCount() >= current.getMaxStackSize()) fullSlots++;
             }
 
-            if (slot < main.length) {
-                ItemStack previous = main[slot];
-                if (first || previous == null || !ItemStack.matches(previous, current)) {
-                    if (!first) addRawId(previous);
-                    if (!first) addRawId(current);
-                    main[slot] = current.isEmpty() ? ItemStack.EMPTY : current.copy();
-                }
+            ItemStack previous = slots[slot];
+            if (first || previous == null || !ItemStack.matches(previous, current)) {
+                if (!first) addRawId(previous);
+                if (!first) addRawId(current);
+                slots[slot] = current.isEmpty() ? ItemStack.EMPTY : current.copy();
             }
         }
-        for (int slot = containerSize; slot < main.length; slot++) {
-            ItemStack previous = main[slot];
+        for (int slot = containerSize; slot < previousSlots.length; slot++) {
+            ItemStack previous = previousSlots[slot];
             if (!first && previous != null && !previous.isEmpty()) addRawId(previous);
-            main[slot] = ItemStack.EMPTY;
         }
         initialized = true;
         return first;
@@ -95,7 +101,7 @@ public final class InventorySnapshot {
                 if (changedRawIds[index] == rawId) return;
             }
             if (changedRawIdCount >= changedRawIds.length) {
-                throw new IllegalStateException("Inventory change set exceeded its fixed safety bound");
+                throw new IllegalStateException("Inventory change set exceeded its slot-derived safety bound");
             }
             changedRawIds[changedRawIdCount++] = rawId;
         }

@@ -36,6 +36,9 @@ neoForge {
 dependencies {
     testImplementation platform('org.junit:junit-bom:5.11.4')
     testImplementation 'org.junit.jupiter:junit-jupiter'
+    // Test the transformed-method guard with the same ASM/Mixin versions as the dev runtime.
+    testImplementation 'org.ow2.asm:asm-tree:9.8'
+    testImplementation('net.fabricmc:sponge-mixin:0.15.2+mixin.0.8.7') { transitive = false }
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 

@@ -15,14 +15,14 @@
 
 ## EXACT algorithm
 
-Listener lifecycle hooks mirror only `InventoryChangeTrigger` registrations. Every `PlayerAdvancements` receives an independent identity index containing all listeners, compiled plans, direct/tag-expanded raw item IDs, wildcard/always/slot-sensitive buckets, listener and tag generations, and a 36-slot main-inventory snapshot.
+Listener lifecycle hooks mirror only `InventoryChangeTrigger` registrations. Every `PlayerAdvancements` receives an independent identity index containing all listeners, compiled plans, direct/tag-expanded raw item IDs, wildcard/always/slot-sensitive buckets, listener and tag generations, and a snapshot of every slot exposed by `Inventory.getContainerSize()`.
 
-Full listener registration never constructs the index one listener at a time. The vanilla listener set remains authoritative while a private index is warmed in bounded server-thread slices. Triggers use vanilla until the complete source set and registry generation are revalidated and the index is atomically published. Trigger-instance plans are shared across players for one registry generation and discarded on reload.
+Full listener registration never constructs the index one listener at a time. The vanilla listener set remains authoritative while a private index is warmed in bounded server-thread slices. Triggers use vanilla until the complete source set and registry generation are revalidated and the index is atomically published. Individual callbacks no longer discard an in-flight build. At publication, removed listeners are pruned; additions, changed advancement/trigger identities and duplicate logical keys reject the build before pruning and require a fresh source. Full registration, removal of all listeners, reload and disabling the optimizer still discard the private build. Trigger-instance plans are shared across players for one registry generation and discarded on reload.
 
 For each trigger on the server thread:
 
 1. Full/empty/occupied counts are calculated once over the same Inventory slots as vanilla.
-2. The 36 main slots are compared with `ItemStack.matches`, which covers item, count, and all Data Components. Only changed stacks are copied. Both old and new item IDs are retained.
+2. All inventory slots, including armor and offhand, are compared with `ItemStack.matches`, which covers item, count, and Data Components according to the platform's equality semantics. Only changed stacks are copied. Both old and new item IDs are retained, including disappearing slots when a compatible custom inventory shrinks.
 3. Candidates are the identity union of always, wildcard, slot-sensitive, every changed old/new item ID, and the supplied changed stack's item ID.
 4. Minecraft's own `TriggerInstance.matches(...)` runs for every candidate, followed in vanilla order by the original `ContextAwarePredicate`.
 5. Matching listeners are collected first and only then run through `Listener.run(PlayerAdvancements)`. This preserves `PlayerAdvancements.award`, Bukkit/Paper advancement events, and the once-only criterion lifecycle.
@@ -71,6 +71,8 @@ All commands require permission level 4 (server operator):
 
 Metrics include trigger count, raw/candidate listener totals, reduction, `ItemPredicate.test` calls, full scans, fallbacks by reason, index conditions (`unsafe_plan` and `remove_miss`), mismatches, total/average/P95/max latency, and top player/item registry-ID hotspots. Predicate scopes and listener indexes are not maintained while the global mode is `VANILLA` or the optimizer is disabled.
 
+Version 1.0.3 adds `warmup_started`, `warmup_completed`, `warmup_restarted_listeners`, `warmup_restarted_registry`, and `warmup_pruned_listeners` under `indexConditions`. Compare counter deltas over the same profiling interval to distinguish removal churn from real additions/replacements. The existing `warmup_listeners` counts consumed source entries, including entries later pruned.
+
 ## Build and test
 
 ```powershell
@@ -79,7 +81,7 @@ Metrics include trigger count, raw/candidate listener totals, reduction, `ItemPr
 .\gradlew.bat build
 ```
 
-The randomized differential test models 5,000 listeners across 10,000 sequential inventory events, including first-pass registration and once-only award removal. GameTests cover count decrease, empty transitions, Data Component-only mutation, and authoritative multi-predicate/count matching. See [BENCHMARK.md](BENCHMARK.md) and [MIXIN_COMPATIBILITY.md](MIXIN_COMPATIBILITY.md).
+The randomized differential test models 5,000 listeners across 10,000 sequential inventory events, including first-pass registration and once-only award removal. GameTests cover count decrease, empty transitions, Data Component-only mutation, equipment/extra slots, inventory resizing, authoritative multi-predicate/count matching, warmup removal churn and rejection of stale authority. A server-player test exercises real trigger mixins, once-only XP rewards, criterion revocation and reload fallback. ASM tests reject incomplete or misplaced hook applications. See [BENCHMARK.md](BENCHMARK.md) and [MIXIN_COMPATIBILITY.md](MIXIN_COMPATIBILITY.md).
 
 ## Operational rollback
 

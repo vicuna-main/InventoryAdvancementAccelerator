@@ -266,6 +266,7 @@ public final class PlayerIndex {
         private final long registryGeneration;
         private int position;
         private int unsafePlans;
+        private int removedListeners;
         private boolean finished;
 
         private Builder(
@@ -303,6 +304,44 @@ public final class PlayerIndex {
 
         public int unsafePlans() {
             return unsafePlans;
+        }
+
+        public int removedListeners() {
+            return removedListeners;
+        }
+
+        /**
+         * Revalidates a completed, unpublished build against the current vanilla set.
+         * Removals cannot introduce a new plan, so they can be pruned without compiling
+         * surviving listeners again. Additions, replacements and duplicate logical keys
+         * fail validation before any pruning. The caller must retry from a fresh source.
+         */
+        public boolean retainAuthoritative(
+                List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> authoritative) {
+            if (!complete() || finished) {
+                throw new IllegalStateException("Only a complete unpublished build can be reconciled");
+            }
+            Set<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> retained = IdentitySet.create();
+            for (CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance> listener : authoritative) {
+                CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance> expected =
+                        index.canonicalListeners.get(key(listener));
+                if (expected == null || expected.advancement() != listener.advancement()
+                        || expected.trigger() != listener.trigger() || !retained.add(expected)) {
+                    return false;
+                }
+            }
+
+            // Walk backwards because removal uses a swap-with-last dense listener store.
+            for (int position = index.listeners.size() - 1; position >= 0; position--) {
+                CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance> listener = index.listeners.get(position);
+                if (!retained.contains(listener)) {
+                    CompiledPlan plan = index.plans.get(listener);
+                    if (plan != null && !plan.indexSafe()) unsafePlans--;
+                    index.remove(listener);
+                    removedListeners++;
+                }
+            }
+            return true;
         }
 
         public boolean matches(

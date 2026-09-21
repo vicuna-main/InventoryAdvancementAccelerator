@@ -125,7 +125,8 @@ public final class InventoryAdvancementRuntime {
                 (CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>) listener;
         synchronized (indexes) {
             resumeIndexMaintenance();
-            invalidateActiveWarmup(advancements, true);
+            // A callback can be a duplicate registration. Keep the private build and
+            // revalidate the authoritative set before publication instead of restarting.
             PlayerIndex index = indexes.get(advancements);
             if (index == null) return;
             PlayerIndex.AddResult result = index.add(typed, registryGeneration.get());
@@ -143,7 +144,8 @@ public final class InventoryAdvancementRuntime {
         }
         synchronized (indexes) {
             resumeIndexMaintenance();
-            invalidateActiveWarmup(advancements, true);
+            // Awards routinely remove listeners while the original trigger is active.
+            // Publication prunes those removals without discarding completed warmup work.
             PlayerIndex index = indexes.get(advancements);
             if (index == null) return;
             if (!index.remove((CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>) listener)) {
@@ -400,6 +402,7 @@ public final class InventoryAdvancementRuntime {
                                 advancements,
                                 PlayerIndex.builder(planCompiler, listeners, generation),
                                 generation);
+                        stats.recordIndexCondition("warmup_started");
                     }
 
                     int compiled = 0;
@@ -423,13 +426,15 @@ public final class InventoryAdvancementRuntime {
 
     private void publishWarmup(WarmupTask task) {
         if (task.registryGeneration() != registryGeneration.get()) {
+            stats.recordIndexCondition("warmup_restarted_registry");
             requeueWarmup(task.advancements());
             return;
         }
         try {
             List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> authoritative =
                     currentListeners(CriteriaTriggers.INVENTORY_CHANGED, task.advancements());
-            if (!sameListeners(authoritative, task.builder())) {
+            if (!task.builder().retainAuthoritative(authoritative)) {
+                stats.recordIndexCondition("warmup_restarted_listeners");
                 requeueWarmup(task.advancements());
                 return;
             }
@@ -437,6 +442,7 @@ public final class InventoryAdvancementRuntime {
             stats.recordIndexCondition("unsafe_plan", task.builder().unsafePlans());
             stats.recordIndexCondition("warmup_completed");
             stats.recordIndexCondition("warmup_listeners", task.builder().sourceSize());
+            stats.recordIndexCondition("warmup_pruned_listeners", task.builder().removedListeners());
             indexes.put(task.advancements(), index);
             listenerAccessFailureLogged = false;
         } catch (RuntimeException | LinkageError exception) {
@@ -446,14 +452,6 @@ public final class InventoryAdvancementRuntime {
             }
             indexes.remove(task.advancements());
         }
-    }
-
-    private static boolean sameListeners(
-            List<CriterionTrigger.Listener<InventoryChangeTrigger.TriggerInstance>> authoritative,
-            PlayerIndex.Builder builder) {
-        // The vanilla set is authoritative. A generation-free final equality check prevents a
-        // bypassing mixin from causing a stale private build to become visible.
-        return builder.matches(authoritative);
     }
 
     private void queueWarmup(PlayerAdvancements advancements) {
@@ -479,13 +477,6 @@ public final class InventoryAdvancementRuntime {
     private void cancelWarmup(PlayerAdvancements advancements) {
         pendingWarmupSet.remove(advancements);
         if (activeWarmup != null && activeWarmup.advancements() == advancements) activeWarmup = null;
-    }
-
-    private void invalidateActiveWarmup(PlayerAdvancements advancements, boolean requeue) {
-        if (activeWarmup != null && activeWarmup.advancements() == advancements) {
-            activeWarmup = null;
-            if (requeue) queueWarmup(advancements);
-        }
     }
 
     @SuppressWarnings("unchecked")
